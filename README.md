@@ -6,4 +6,4 @@ Creating and testing generalization of agent in Open-ai Procgen CoinRun environm
 - helpers.py -> WandB 초기 설정, 비디오 logging 저장 등
 
 bash
-₩python main.py --algo PPO --shaping False₩
+`python main.py --algo PPO --shaping False`
