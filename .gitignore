@@ -1,0 +1,7 @@
+# .gitignore 파일 내용 예시
+.venv/
+__pycache__/
+*.pt
+*.pth
+wandb/
+.outputs/
