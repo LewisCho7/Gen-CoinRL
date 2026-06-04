@@ -7,6 +7,8 @@ import joblib
 import numpy as np
 import tensorflow as tf
 from collections import deque
+import csv
+import os
 
 from mpi4py import MPI
 
@@ -190,9 +192,10 @@ class Runner(AbstractEnvRunner):
             # Take actions in env and look the results
             # Infos contains a ton of useful informations
             self.obs[:], rewards, self.dones, infos = self.env.step(actions)
-            for info in infos:
+            for i, info in enumerate(infos):
                 maybeepinfo = info.get('episode')
-                if maybeepinfo: epinfos.append(maybeepinfo)
+                if maybeepinfo and self.dones[i]: 
+                    epinfos.append(maybeepinfo)
             mb_rewards.append(rewards)
         #batch of steps to batch of rollouts
         mb_obs = np.asarray(mb_obs, dtype=self.obs.dtype)
@@ -238,7 +241,56 @@ def constfn(val):
 def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
             vf_coef=0.5,  max_grad_norm=0.5, gamma=0.99, lam=0.95,
             log_interval=10, nminibatches=4, noptepochs=4, cliprange=0.2,
-            save_interval=0, load_path=None):
+            save_interval=0, load_path=None,
+            eval_env=None, eval_interval=1000000):
+
+    #///////////////
+    # --- [연구원님 맞춤형 데이터 추출 세팅] ---
+    log_dir = "tracked_metrics"
+    os.makedirs(log_dir, exist_ok=True)
+
+    # 1. Loss 저장용 CSV
+    loss_file = open(os.path.join(log_dir, "losses.csv"), "w", newline="")
+    loss_writer = csv.writer(loss_file)
+    loss_writer.writerow(["timestep", "policy_loss", "value_loss", "policy_entropy", "approxkl", "clipfrac", "l2_loss"])
+
+    # 2. 리워드 빈도 저장용 CSV (누적 및 100만 구간)
+    reward_file = open(os.path.join(log_dir, "rewards_and_reasons.csv"), "w", newline="")
+    reward_writer = csv.writer(reward_file)
+    reward_writer.writerow(["timestep", "type", "reason", "count"]) # type: cumulative / interval_1M
+
+    # 3. 에피소드 끝나는 이유별 평균 길이 및 보상 저장용 CSV
+    episode_file = open(os.path.join(log_dir, "episode_stats_by_reason.csv"), "w", newline="")
+    ep_writer = csv.writer(episode_file)
+    ep_writer.writerow(["timestep", "reason", "avg_length", "avg_reward"])
+
+    # 4. 10번 에피소드당 평균 reward 저장용 CSV
+    recent_10_file = open(os.path.join(log_dir, "recent_update_rewards.csv"), "w", newline="")
+    recent_10_writer = csv.writer(recent_10_file)
+    recent_10_writer.writerow(["timestep", "avg_reward_1update"])
+    
+    # --- 💡 [추가] 5. Validation 결과 저장용 CSV ---
+    if eval_env is not None:
+        val_file = open(os.path.join(log_dir, "validation_stats.csv"), "w", newline="")
+        val_writer = csv.writer(val_file)
+        val_writer.writerow(["timestep", "val_avg_reward", "val_success_rate"])
+        next_val_checkpoint = eval_interval
+    # -----------------------------------------------
+
+    # 내부 카운터 및 버퍼 초기화
+    recent_10_rewards = []
+    
+    # dummy_info 예시 후보들 ('coin', 'death', 'fall', 'timeout' 등)
+    cumulative_counts = {}
+    interval_counts = {}
+    episode_lengths_by_reason = {}
+    episode_rewards_by_reason = {}
+
+    next_1m_checkpoint = 1000000
+    # ----------------------------------------
+    #/////////////////
+
+
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     mpi_size = comm.Get_size()
@@ -302,6 +354,42 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
         run_tstart = time.time()
 
         obs, returns, masks, actions, values, neglogpacs, states, epinfos = runner.run()
+        # ////////////////////////
+        # --- [에피소드 종료 원인 및 리워드 분석 분석 로직] ---
+        current_step = update * nbatch  # 💡 추가: 현재 몇 번째 스텝인지 계산f
+        
+        for epinfo in epinfos:
+            r = epinfo.get('r', 0) # 에피소드 총 보상
+            l = epinfo.get('l', 0) # 에피소드 길이
+            
+            # 💡 [수정됨] C++ dummy_info 없이 점수와 길이만으로 원인 추론하기
+            if r > 0:
+                reason = 'success_coin'   # 코인을 먹고 깸
+            elif l >= 1000:
+                reason = 'timeout'        # 1000스텝 동안 코인 못 먹고 시간 초과
+            else:
+                reason = 'death'          # 1000스텝 전에 점수 없이 끝남 (톱니바퀴, 괴물, 낙사)
+
+            if reason not in cumulative_counts:
+                cumulative_counts[reason] = 0
+                interval_counts[reason] = 0
+                episode_lengths_by_reason[reason] = []
+                episode_rewards_by_reason[reason] = []
+
+            cumulative_counts[reason] += 1
+            interval_counts[reason] += 1
+            episode_lengths_by_reason[reason].append(l)
+            episode_rewards_by_reason[reason].append(r)
+
+            recent_10_rewards.append(r)
+
+        if len(recent_10_rewards) > 0:
+            batch_avg = sum(recent_10_rewards) / len(recent_10_rewards)
+            recent_10_writer.writerow([current_step, batch_avg])
+            recent_10_file.flush()
+            recent_10_rewards.clear()
+        # ///////////////////////
+        # --------------------------------------------------
         epinfobuf10.extend(epinfos)
         epinfobuf100.extend(epinfos)
 
@@ -376,6 +464,12 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
                     mpi_print(lossname, lossval)
                     tb_writer.log_scalar(lossval, lossname)
             mpi_print('----\n')
+            # ///////////
+            if len(lossvals) >= 6: 
+                # [step] 뒤에 lossvals 리스트의 6개 항목을 쫙 풀어서 연결해줍니다.
+                loss_writer.writerow([step] + list(lossvals))
+                loss_file.flush()
+            # ///////////
 
         if can_save:
             if save_interval and (update % save_interval == 0):
@@ -385,6 +479,83 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
                 if (not saved_key_checkpoints[j]) and (step >= (checkpoint * 1e6)):
                     saved_key_checkpoints[j] = True
                     save_model(str(checkpoint) + 'M')
+
+        # --- [100만 타임스텝 체크포인트 정산 (누락됐던 부분!)] ---
+        current_step = update * nbatch
+        if current_step >= next_1m_checkpoint:
+            for reason_key in cumulative_counts.keys():
+                # 누적 빈도 및 100만번 마다의 개별 빈도 기록
+                reward_writer.writerow([next_1m_checkpoint, "cumulative", reason_key, cumulative_counts[reason_key]])
+                reward_writer.writerow([next_1m_checkpoint, "interval_1M", reason_key, interval_counts[reason_key]])
+                
+                # 끝나는 이유별 에피소드 평균 길이 및 보상 정산
+                lengths = episode_lengths_by_reason[reason_key]
+                rewards = episode_rewards_by_reason[reason_key]
+                avg_l = sum(lengths) / len(lengths) if lengths else 0
+                avg_r = sum(rewards) / len(rewards) if rewards else 0
+                ep_writer.writerow([next_1m_checkpoint, reason_key, avg_l, avg_r])
+            
+            reward_file.flush()
+            episode_file.flush()
+
+            # 100만번 개별 구간 카운터 및 버퍼 리스트 비우기 (누적은 유지)
+            for reason_key in interval_counts.keys():
+                interval_counts[reason_key] = 0
+                episode_lengths_by_reason[reason_key] = []
+                episode_rewards_by_reason[reason_key] = []
+                
+            next_1m_checkpoint += 1000000
+
+        if eval_env is not None and current_step >= next_val_checkpoint:
+            mpi_print(f"\n>>> Running Validation at {current_step} steps... <<<")
+            
+            val_obs = eval_env.reset()
+            val_states = model.initial_state
+            val_dones = [False for _ in range(eval_env.num_envs)]
+            
+            val_ep_rewards = []
+            val_ep_successes = []
+            
+            # 평가용으로 총 20개의 에피소드를 플레이합니다.
+            while len(val_ep_rewards) < 20:
+                
+                # --- 💡 [Shape 에러 해결] 1개짜리 데이터를 128개(nenvs) 크기로 뻥튀기(Padding) ---
+                # 1. 128개짜리 빈 껍데기(0)를 만들고, 첫 번째 칸에만 진짜 화면을 넣습니다.
+                padded_obs = np.zeros((nenvs,) + val_obs.shape[1:], dtype=val_obs.dtype)
+                padded_obs[0] = val_obs[0]
+                
+                # 2. 게임 종료(Done) 상태도 128개짜리로 맞춥니다.
+                padded_dones = np.zeros(nenvs, dtype=np.bool)
+                padded_dones[0] = val_dones[0]
+                
+                # 3. 훈련된 모델에 128개 묶음을 통째로 넣고 행동을 예측합니다.
+                padded_actions, _, val_states, _ = model.step(padded_obs, val_states, padded_dones)
+                
+                # 4. 128개의 행동 결과 중, 진짜 화면에 대한 '첫 번째 행동'만 쏙 잘라냅니다.
+                val_actions = padded_actions[0:1]
+                # -------------------------------------------------------------------------
+                
+                val_obs, val_rewards, val_dones, val_infos = eval_env.step(val_actions)
+                
+                for i, info in enumerate(val_infos):
+                    maybeepinfo = info.get('episode')
+                    if maybeepinfo and val_dones[i]:
+                        r = maybeepinfo['r']
+                        val_ep_rewards.append(r)
+                        val_ep_successes.append(1 if r > 0 else 0) # 리워드가 0보다 크면 클리어(성공)로 간주
+                        
+            val_avg_reward = np.mean(val_ep_rewards)
+            val_success_rate = np.mean(val_ep_successes)
+            
+            mpi_print(f">>> Validation Result - Avg Reward: {val_avg_reward:.3f} | Success Rate: {val_success_rate*100:.1f}% <<<")
+            
+            # CSV에 기록
+            val_writer.writerow([current_step, val_avg_reward, val_success_rate])
+            val_file.flush()
+            
+            # 다음 평가 시점 업데이트
+            next_val_checkpoint += eval_interval
+        # ----------------------------------------
 
     save_model()
 
