@@ -22,20 +22,17 @@ def main():
     utils.setup_mpi_gpus()
 
     config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True 
-    #config.gpu_options.per_process_gpu_memory_fraction = 0.3  # GPU 메모리의 40%만 사용하도록 엄격히 제한
-    #config.allow_soft_placement = True                        # 특정 연산이 GPU에서 안 될 경우 CPU로 자동 전환
-    #config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.OFF
+    config.gpu_options.allow_growth = True # pylint: disable=E1101
 
     nenvs = Config.NUM_ENVS
-    total_timesteps = int(256000000)
+    total_timesteps = int(128000000)
     save_interval = args.save_interval
 
     env = utils.make_general_env(nenvs, seed=rank)
-
+    eval_env = utils.make_general_env(1, seed=10000 + rank)
     with tf.Session(config=config):
         env = wrappers.add_final_wrappers(env)
-        
+        eval_env = wrappers.add_final_wrappers(eval_env)
         policy = policies.get_policy()
 
         ppo2.learn(policy=policy,
@@ -50,7 +47,10 @@ def main():
                     ent_coef=Config.ENTROPY_COEFF,
                     lr=lambda f : f * Config.LEARNING_RATE,
                     cliprange=lambda f : f * 0.2,
-                    total_timesteps=total_timesteps)
+                    total_timesteps=total_timesteps,
+                    eval_env=eval_env,          # 추가: 평가용 환경 전달
+                    eval_interval=1000000       # 추가: 100만 타임스텝마다 평가 진행
+                    )
 
 if __name__ == '__main__':
     main()
